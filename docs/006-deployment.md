@@ -233,10 +233,13 @@ The blocks:
 
 Changing a repository or CLI runs the corresponding setup check first. A failed check returns 400 with details in `setup`. A successful account change, or any save while setup is pending, returns `restarting: true`. The API is temporarily unavailable while the application restarts.
 
+This example uses `DSH_SUPERAGENT_URL` when set, as the service script does. For Tailscale access, export the server's URL in this shell first; otherwise it defaults to local access.
+
 ```sh
-api=http://127.0.0.1:3082/orchestrator/api
-rev=$(curl -s -H 'x-orchestrator-request: 1' $api/settings | jq '.sources[] | select(.id == "github") | .revision')
-curl -s -X PUT -H 'x-orchestrator-request: 1' -H 'content-type: application/json' $api/settings/source:github \
+superagent_url=${DSH_SUPERAGENT_URL:-http://127.0.0.1:3082}
+api="${superagent_url%/}/orchestrator/api"
+rev=$(curl -s -H 'x-orchestrator-request: 1' "$api/settings" | jq '.sources[] | select(.id == "github") | .revision')
+curl -s -X PUT -H 'x-orchestrator-request: 1' -H 'content-type: application/json' "$api/settings/source:github" \
   -d "{\"value\": {\"enabled\": true, \"config\": {\"repository\": \"acme/widgets\", \"cli\": \"$HOME/.local/bin/gh-agent\"}}, \"revision\": $rev}"
 ```
 
