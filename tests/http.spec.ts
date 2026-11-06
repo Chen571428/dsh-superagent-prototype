@@ -1,4 +1,4 @@
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { registerHttp } from '../src/app/http.ts'
 import { PromptConflict } from '../src/app/prompts.ts'
@@ -10,9 +10,9 @@ import { SetupError } from '../src/setup.ts'
 type Handler = (req: unknown, res: unknown) => Promise<void>
 type Headers = Record<string, string | undefined>
 /** Mount management HTTP routes on a fake web server and return a request helper that includes default panel headers. */
-function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.0.1') {
+function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.0.1', protocol = 'http:', port = 3082) {
   let handler: Handler = async () => {}
-  const ctx = { webServer: { host, port: 3082, register: (route: { handler: Handler }) => { handler = route.handler; return () => {} } } }
+  const ctx = { webServer: { host, port, protocol, register: (route: { handler: Handler }) => { handler = route.handler; return () => {} } } }
   registerHttp(ctx as never, { ready: Promise.resolve(), ...runtime } as unknown as HttpHost)
   return async (method: string, path: string, body?: unknown, headers: Headers = {}) => {
     let status = 0, text = ''
@@ -76,8 +76,49 @@ it('answers only a same-origin request from the panel on the loopback address', 
       body: { error: 'Same-origin management request required' } })
   }
   expect(await post({ host: 'localhost:3082', origin: 'http://localhost:3082' })).toMatchObject({ status: 200 })
-  // Management routes require a loopback Web server.
-  expect(() => serve({}, '0.0.0.0')).toThrow('Orchestrator management requires a loopback Web server')
+  expect(await post({})).toMatchObject({ status: 200 })
+})
+
+it('accepts the configured Tailscale address and refuses other hosts, origins and forwarded-header overrides', async () => {
+  const unsubscribe = vi.fn(() => true)
+  const call = serve({ sessions: { delivery: async () => 'injected' }, engine: { unsubscribe } }, '100.101.102.103')
+  const host = '100.101.102.103:3082'
+  const post = (headers: Headers = {}) => call('POST', 'threads/github%3A1/unsubscribe', undefined,
+    { host, origin: `http://${host}`, ...headers })
+  expect(await post()).toMatchObject({ status: 200 })
+  // CLI health checks do not send Origin, but still need the custom request header and correct Host.
+  expect(await post({ origin: undefined })).toMatchObject({ status: 200 })
+  for (const headers of [
+    { 'x-orchestrator-request': undefined }, { host: '100.101.102.104:3082' }, { host: '100.101.102.103:9999' },
+    { host: 'localhost:3082', origin: 'http://localhost:3082' }, { host: 'evil.example:3082', origin: 'http://evil.example:3082' },
+    { origin: 'http://evil.example' }, { origin: 'null' }, { origin: `https://${host}` },
+    { host: 'evil.example:3082', 'x-forwarded-host': host },
+    { origin: `https://${host}`, 'x-forwarded-proto': 'https' },
+  ]) expect(await post(headers), JSON.stringify(headers)).toMatchObject({ status: 403 })
+  expect(unsubscribe).toHaveBeenCalledTimes(2)
+})
+
+it.each([
+  ['::1', '[::1]:3082', 'http:', 3082],
+  ['::ffff:100.101.102.103', '100.101.102.103:3082', 'http:', 3082],
+  ['fd7a:115c:a1e0::1', '[fd7a:115c:a1e0::1]:3082', 'http:', 3082],
+  ['100.101.102.103', '100.101.102.103', 'http:', 80],
+  ['100.101.102.103', '100.101.102.103', 'https:', 443],
+  ['100.101.102.103', '100.101.102.103:443', 'https:', 443],
+  ['100.101.102.103', '100.101.102.103:3082', 'https:', 3082],
+])('matches the configured address and transport: %s / %s / %s', async (bindHost, host, protocol, port) => {
+  const call = serve({ sessions: { delivery: async () => 'injected' }, engine: { unsubscribe: () => true } }, bindHost, protocol, port)
+  const origin = new URL(`${protocol}//${host}`).origin
+  expect(await call('POST', 'threads/github%3A1/unsubscribe', undefined, { host, origin })).toMatchObject({ status: 200 })
+  expect(await call('POST', 'threads/github%3A1/unsubscribe', undefined,
+    { host, origin: origin.replace(/^https?:/, protocol === 'http:' ? 'https:' : 'http:') })).toMatchObject({ status: 403 })
+})
+
+it('refuses wildcard and non-literal bind addresses', () => {
+  for (const host of ['0.0.0.0', '::', '::ffff:0.0.0.0']) {
+    expect(() => serve({}, host)).toThrow('Orchestrator management requires a concrete Web server address')
+  }
+  expect(() => serve({}, 'evil.example')).toThrow()
 })
 
 it('answers a prompt save that lost a race with 409, and a settings body over 128 KiB with 400', async () => {

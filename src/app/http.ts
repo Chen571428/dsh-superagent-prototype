@@ -1,6 +1,6 @@
-/** Loopback-only management HTTP routes with same-origin enforcement for the web panel. */
+/** Management HTTP routes with same-origin enforcement tied to the configured listener. */
 import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@deepseek-ai/dsh-host-webserver'
+import { isLoopbackHost, isWildcardHost, normalizeBindAddress } from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
@@ -72,10 +72,17 @@ async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<un
 function json(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }); res.end(JSON.stringify(value))
 }
-export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number): boolean {
+/** Accept only the configured listener's authority (and localhost for loopback), never forwarded headers. */
+export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number, bindHost = '127.0.0.1', protocol = 'http:'): boolean {
+  if (isWildcardHost(bindHost)) return false
+  const address = normalizeBindAddress(bindHost)
+  const hosts = [address.includes(':') ? `[${address}]` : address]
+  if (isLoopbackHost(bindHost)) hosts.push('localhost')
   const host = req.headers.host
-  if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) return false
-  return req.headers['x-orchestrator-request'] === '1' && (req.headers.origin === undefined || req.headers.origin === `http://${host}`)
+  const defaultPort = protocol === 'https:' ? 443 : 80
+  if (!hosts.some(value => host === `${value}:${port}` || (port === defaultPort && host === value))) return false
+  const origin = new URL(`${protocol}//${host}`).origin
+  return req.headers['x-orchestrator-request'] === '1' && (req.headers.origin === undefined || req.headers.origin === origin)
 }
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
@@ -228,13 +235,16 @@ function match(table: Routes, method: string, segments: string[]) {
   return undefined
 }
 export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
-  if (ctx.webServer.host !== '127.0.0.1') throw new Error('Orchestrator management requires a loopback Web server')
+  if (isWildcardHost(ctx.webServer.host)) throw new Error('Orchestrator management requires a concrete Web server address')
+  normalizeBindAddress(ctx.webServer.host)
   const table = routes(runtime)
   const disposers = [
     ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://localhost')
       if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
-      if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
+      if (!sameOrigin(req, ctx.webServer.port, ctx.webServer.host, ctx.webServer.protocol)) {
+        json(res, 403, { error: 'Same-origin management request required' }); return
+      }
       try {
         await runtime.ready
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
