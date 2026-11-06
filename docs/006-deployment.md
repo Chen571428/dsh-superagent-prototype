@@ -4,7 +4,7 @@ Use this guide to install, configure and operate dsh-superagent. It covers accou
 
 ## What runs
 
-- **A dedicated DeepSeek Harness profile**, called `superagent` in this guide. Create it from the Web profile template. It loads the bundle and serves its panel on `127.0.0.1`. Keep it separate from the profile you work in: the plugin changes process-wide `PATH` and git settings, and its process needs independent restarts and upgrades.
+- **A dedicated DeepSeek Harness profile**, called `superagent` in this guide. Create it from the Web profile template. It loads the bundle and serves its panel on `127.0.0.1` by default, or one configured interface address for team access. Keep it separate from the profile you work in: the plugin changes process-wide `PATH` and git settings, and its process needs independent restarts and upgrades.
 - **An agent GitHub account.** The agent comments, pushes branches and opens pull requests as this account, through a GitHub CLI signed in only as that account.
 - **Optional:** a Feishu bot for chat requests.
 
@@ -99,6 +99,33 @@ After the first start, edit machine limits in **Settings → Deployment** or the
 
 ## Start and stop
 
+### Team access over Tailscale
+
+To open the panel directly from teammates' computers, set the profile's existing `webserver.config.host` to the server's Tailscale IPv4 address (from `tailscale ip -4`). Keep the other profile entries, including `dsh-superagent.config.stateDir`, unchanged:
+
+```yaml
+- id: webserver
+  config:
+    host: 100.101.102.103 # Example only: replace with this server's Tailscale IP.
+    port: 3082
+```
+
+The listener binds only that interface; `0.0.0.0` and `::` remain unsupported. Tailscale must be running with that IP assigned before DSH starts. Share the machine with the three teammates, and allow their access to TCP port 3082 in the Tailscale policy and host firewall. They open `http://100.101.102.103:3082` while connected to Tailscale. Use the literal IP: MagicDNS names and reverse-proxy hostnames are not automatically accepted.
+
+The management API follows the listener's address, port and HTTP/HTTPS protocol. It still requires `x-orchestrator-request: 1` and rejects cross-origin browser requests. This is request validation, not a login system: everyone who can reach this listener can manage Superagent. Restrict network access to the intended team; the listener also serves the rest of the DSH Web profile.
+
+Point the service script at the same address, since it no longer listens on `127.0.0.1`. For example, after saving the profile configuration:
+
+```sh
+export DSH_SUPERAGENT_URL=http://100.101.102.103:3082
+scripts/dsh-superagent restart
+scripts/dsh-superagent status
+```
+
+Persist that environment variable for future script invocations, or pass `--url http://100.101.102.103:3082` each time, including in the hourly check. Binding changes require restarting the profile. To return to local access, restore `host: 127.0.0.1`, unset `DSH_SUPERAGENT_URL`, and restart. This configuration does not require an SSH tunnel or Tailscale Serve.
+
+### Service commands
+
 ```sh
 scripts/dsh-superagent start
 scripts/dsh-superagent status
@@ -160,7 +187,7 @@ Setup must succeed before polling or work starts. Overview lists missing require
 
 The panel uses a local HTTP API that agents can also call. `SETUP.md` uses it to save settings, and the service script reads `GET state`.
 
-Send requests to `http://127.0.0.1:<port>/orchestrator/api/` with `x-orchestrator-request: 1`. The host must be `127.0.0.1:<port>` or `localhost:<port>`. Missing headers or an `Origin` from another site receive 403.
+Send requests to the configured listener's `/orchestrator/api/` with `x-orchestrator-request: 1` (by default, `http://127.0.0.1:<port>/orchestrator/api/`). The Host must match its concrete IP and port; loopback listeners also accept `localhost`. IPv6 authorities use brackets. When present, Origin must exactly match that Host and the listener's HTTP/HTTPS protocol. Default ports follow URL origin normalization. Forwarded headers never grant access. Missing request headers, an unrecognized Host, or an Origin from another site receive 403.
 
 API saves have the panel's permissions. They can change execution environment and setup account fields, unlike saves made through the main Session's tools.
 
@@ -206,10 +233,13 @@ The blocks:
 
 Changing a repository or CLI runs the corresponding setup check first. A failed check returns 400 with details in `setup`. A successful account change, or any save while setup is pending, returns `restarting: true`. The API is temporarily unavailable while the application restarts.
 
+This example uses `DSH_SUPERAGENT_URL` when set, as the service script does. For Tailscale access, export the server's URL in this shell first; otherwise it defaults to local access.
+
 ```sh
-api=http://127.0.0.1:3082/orchestrator/api
-rev=$(curl -s -H 'x-orchestrator-request: 1' $api/settings | jq '.sources[] | select(.id == "github") | .revision')
-curl -s -X PUT -H 'x-orchestrator-request: 1' -H 'content-type: application/json' $api/settings/source:github \
+superagent_url=${DSH_SUPERAGENT_URL:-http://127.0.0.1:3082}
+api="${superagent_url%/}/orchestrator/api"
+rev=$(curl -s -H 'x-orchestrator-request: 1' "$api/settings" | jq '.sources[] | select(.id == "github") | .revision')
+curl -s -X PUT -H 'x-orchestrator-request: 1' -H 'content-type: application/json' "$api/settings/source:github" \
   -d "{\"value\": {\"enabled\": true, \"config\": {\"repository\": \"acme/widgets\", \"cli\": \"$HOME/.local/bin/gh-agent\"}}, \"revision\": $rev}"
 ```
 

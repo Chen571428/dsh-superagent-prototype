@@ -2,6 +2,8 @@
 # Replace <placeholders> before first start; see docs/006-deployment.md.
 - id: webserver
   config:
+    # For team access, replace with this server's concrete Tailscale IP (tailscale ip -4).
+    # Also point DSH_SUPERAGENT_URL at that IP; see docs/006-deployment.md.
     host: 127.0.0.1
     port: 3082
 - id: dsh-superagent
